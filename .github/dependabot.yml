@@ -4,9 +4,18 @@ updates:
   directory: "/"
   schedule:
     interval: weekly
-  target-branch: master
+    day: monday
+    time: "05:00"
+  target-branch: ci/dependabot-updates
+  labels:
+    - dependencies
+    - python
 - package-ecosystem: github-actions
   directory: "/"
   schedule:
     interval: daily
-  target-branch: master
+    time: "05:00"
+  target-branch: ci/dependabot-updates
+  labels:
+    - dependencies
+    - github_actions

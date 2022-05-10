@@ -1,12 +1,39 @@
+"""push_action.run
+
+This is the main module implementing the CLI `push-action`.
+
+The steps of progression for the whole of the action are the following:
+
+1) Get required statuses for branch (GitHub Actions jobs / third party status checks)
+   from:
+   https://api.github.com/repos/:owner/:repo/branches/:branch
+   protection -> required_status_checks -> contexts
+
+2) Get GitHub Actions runs for specific workflow:
+   https://api.github.com/repos/:owner/:repo/actions/workflows/:workflow_id/runs
+   :workflow_id can also be :workflow_file_name (e.g., 'main.yml')
+   Get :run_id from this
+
+3) Get names and statuses of jobs in specific run:
+   https://api.github.com/repos/:owner/:repo/actions/runs/:run_id/jobs
+   Match found required GitHub Actions runs found in 1)
+
+4) Wait and do 3) again until required GitHub Actions jobs have "status": "completed"
+   If "conclusion": "success" YAY
+   If "conclusion" != "success" FAIL this action
+
+"""
 import argparse
 import json
 import os
 import sys
 from time import sleep, time
+from typing import TYPE_CHECKING
 
 from push_action.cache import IN_MEMORY_CACHE
 from push_action.utils import (
     api_request,
+    check_user_role,
     get_branch_statuses,
     get_required_actions,
     get_required_checks,
@@ -14,12 +41,17 @@ from push_action.utils import (
     remove_branch,
 )
 
+if TYPE_CHECKING:
+    from typing import Any, Dict
+
 
 def wait() -> None:
     """Wait until status checks have finished"""
     required_statuses = get_branch_statuses(IN_MEMORY_CACHE["args"].ref)
     actions_required = get_required_actions(required_statuses)
-    _ = get_required_checks(required_statuses)  # TODO: Currently not implemented
+    _ = get_required_checks(
+        required_statuses
+    )  # TODO: Currently not implemented  # pylint: disable=fixme
 
     print(
         f"""
@@ -30,7 +62,8 @@ Configuration:
         of which are:
             GitHub Action-related: {len(actions_required)}
             Third-party checks: {len(_)}
-"""
+""",
+        flush=True,
     )
 
     start_time = time()
@@ -41,14 +74,16 @@ Configuration:
                 break
         else:
             # All jobs are completed
-            print("All required GitHub Actions jobs complete!")
+            print("All required GitHub Actions jobs complete!", flush=True)
             unsuccessful_jobs = [
                 _ for _ in actions_required if _.get("conclusion", "") != "success"
             ]
             break
 
         # Some jobs have not yet completed
-        print(f"Waiting {IN_MEMORY_CACHE['args'].wait_interval} seconds ...")
+        print(
+            f"Waiting {IN_MEMORY_CACHE['args'].wait_interval} seconds ...", flush=True
+        )
         sleep(IN_MEMORY_CACHE["args"].wait_interval)
 
         run_ids = {_["run_id"] for _ in actions_required}
@@ -63,7 +98,9 @@ Configuration:
             )
         if actions_required:
             print(
-                f"{len(actions_required)} required GitHub Actions jobs have not yet completed!"
+                f"{len(actions_required)} required GitHub Actions jobs have not yet "
+                "completed!",
+                flush=True,
             )
 
     if unsuccessful_jobs:
@@ -75,8 +112,16 @@ Configuration:
 def unprotect_reviews() -> None:
     """Remove pull request review protection for target branch"""
     # Save current protection settings
-    url = f"/repos/{os.getenv('GITHUB_REPOSITORY', '')}/branches/{IN_MEMORY_CACHE['args'].ref}/protection/required_pull_request_reviews"
-    response: dict = api_request(url)
+    url = (
+        f"/repos/{os.getenv('GITHUB_REPOSITORY', '')}/branches"
+        f"/{IN_MEMORY_CACHE['args'].ref}/protection/required_pull_request_reviews"
+    )
+    response = api_request(url)
+
+    if not isinstance(response, dict):
+        raise TypeError(
+            f"Expected response to be a dict, instead it was of type {type(response)}"
+        )
 
     data = {
         "dismiss_stale_reviews": response.get("dismiss_stale_reviews", False),
@@ -86,7 +131,15 @@ def unprotect_reviews() -> None:
         ),
     }
 
-    if "organization" in api_request(f"/repos/{os.getenv('GITHUB_REPOSITORY', '')}"):
+    repository_info = api_request(f"/repos/{os.getenv('GITHUB_REPOSITORY', '')}")
+
+    if not isinstance(repository_info, dict):
+        raise TypeError(
+            "Expected repository_info to be a dict, instead it was of type "
+            f"{type(repository_info)}"
+        )
+
+    if "organization" in repository_info:
         # This key is only allowed for organization repositories
         data["dismissal_restrictions"] = {
             "users": [
@@ -99,7 +152,7 @@ def unprotect_reviews() -> None:
             ],
         }
 
-    with open("tmp_protection_rules.json", "w") as handle:
+    with open("tmp_protection_rules.json", "w", encoding="utf8") as handle:
         json.dump(data, handle)
 
     # Remove protection
@@ -111,11 +164,14 @@ def unprotect_reviews() -> None:
 def protect_reviews() -> None:
     """Re-add pull request review protection for target branch"""
     # Retrieve data
-    with open("tmp_protection_rules.json", "r") as handle:
+    with open("tmp_protection_rules.json", "r", encoding="utf8") as handle:
         data = json.load(handle)
 
     # Add protection
-    url = f"/repos/{os.getenv('GITHUB_REPOSITORY', '')}/branches/{IN_MEMORY_CACHE['args'].ref}/protection/required_pull_request_reviews"
+    url = (
+        f"/repos/{os.getenv('GITHUB_REPOSITORY', '')}/branches"
+        f"/{IN_MEMORY_CACHE['args'].ref}/protection/required_pull_request_reviews"
+    )
     api_request(
         url,
         http_request="patch",
@@ -128,16 +184,21 @@ def protect_reviews() -> None:
 def protected_branch(branch: str) -> str:
     """Determine whether or not `branch` is a protected branch.
 
-    Return branch if it is protected, otherwise return an empty string.
+    Return a non-empty string if it is protected, otherwise return an empty string.
     """
-    url = f"/repos/{os.getenv('GITHUB_REPOSITORY', '')}/branches/{branch}/protection"
-    try:
-        api_request(url)
-    except RuntimeError:
-        # Expected not to be protected
-        return ""
-    else:
-        return branch
+    url = f"/repos/{os.getenv('GITHUB_REPOSITORY', '')}/branches/{branch}"
+    response: "Dict[str, Any]" = api_request(url)  # type: ignore[assignment]
+    if response.get("protected", False):
+        if check_user_role("admin"):
+            return "protected"
+
+        raise RuntimeError(
+            "Not enough rights to continue pushing to a protected branch - should "
+            "have 'admin' permissions (Admin role)."
+        )
+
+    # Not protected, return an empty string
+    return ""
 
 
 def main() -> None:
@@ -153,7 +214,7 @@ def main() -> None:
     parser.add_argument(
         "--ref",
         type=str,
-        help="Target ref (branch/tag) for the push",
+        help="Target ref branch for the push",
         required=True,
     )
     parser.add_argument(
@@ -165,13 +226,19 @@ def main() -> None:
     parser.add_argument(
         "--wait-timeout",
         type=int,
-        help="Time (in minutes) of how long the wait_for_checks should run before timing out",
+        help=(
+            "Time (in minutes) of how long the wait_for_checks should run before "
+            "timing out"
+        ),
         default=15,
     )
     parser.add_argument(
         "--wait-interval",
         type=int,
-        help="Time interval (in seconds) between each new check in the wait_for_checks run",
+        help=(
+            "Time interval (in seconds) between each new check in the wait_for_checks "
+            "run"
+        ),
         default=30,
     )
     parser.add_argument(
@@ -189,7 +256,7 @@ def main() -> None:
 
     IN_MEMORY_CACHE["args"] = parser.parse_args()
 
-    fail = False
+    fail = ""
     try:
         if IN_MEMORY_CACHE["args"].ACTION == "wait_for_checks":
             wait()
@@ -200,33 +267,13 @@ def main() -> None:
         elif IN_MEMORY_CACHE["args"].ACTION == "protect_reviews":
             protect_reviews()
         elif IN_MEMORY_CACHE["args"].ACTION == "protected_branch":
-            print(protected_branch(IN_MEMORY_CACHE["args"].ref), end="")
+            print(protected_branch(IN_MEMORY_CACHE["args"].ref), end="", flush=True)
         else:
             raise RuntimeError(f"Unknown ACTIONS {IN_MEMORY_CACHE['args'].ACTION!r}")
-    except RuntimeError as exc:
+    except Exception as exc:  # pylint: disable=broad-except
         fail = f"{exc.__class__.__name__}: {exc}"
 
     if fail:
         sys.exit(fail)
     else:
         sys.exit()
-
-
-"""
-1) Get required statuses for branch (GitHub Actions jobs / third party status checks) from:
-https://api.github.com/repos/:owner/:repo/branches/:branch
-protection -> required_status_checks -> contexts
-
-2) Get GitHub Actions runs for specific workflow:
-https://api.github.com/repos/:owner/:repo/actions/workflows/:workflow_id/runs
-:workflow_id can also be :workflow_file_name (e.g., 'main.yml')
-Get :run_id from this
-
-3) Get names and statuses of jobs in specific run:
-https://api.github.com/repos/:owner/:repo/actions/runs/:run_id/jobs
-Match found required GitHub Actions runs found in 1)
-
-4) Wait and do 3) again until required GitHub Actions jobs have "status": "completed"
-If "conclusion": "success" YAY
-If "conclusion" != "success" FAIL this action
-"""
